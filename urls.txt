@@ -1,0 +1,6 @@
+# Add URLs to crawl, one per line
+# Lines starting with # are ignored
+
+https://example.com/
+https://example.com/page-2/
+https://example.com/page-3/
