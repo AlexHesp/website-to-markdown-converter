@@ -1,376 +1,194 @@
 #!/usr/bin/env python3
 """
-Multi-URL Crawler using Crawl4AI
-Reads URLs from a file, crawls them efficiently, and outputs:
+Multi-URL Crawler
+Reads URLs from a file, fetches them concurrently, and outputs:
 1. A CSV with URL and markdown content
 2. A combined .md file with all content
-3. Optionally extracts internal links
+3. Optionally, structured folders and extracted internal links
+
+Fetching is plain HTTP (no browser), and content detection is handled by
+trafilatura, which finds the main article body and drops boilerplate itself.
 """
 
-import asyncio
-import csv
-import sys
 import argparse
-import re
+import asyncio
+import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 # Force UTF-8 output for Windows consoles
-sys.stdout.reconfigure(encoding='utf-8')
-from datetime import datetime
-from urllib.parse import urlparse
+sys.stdout.reconfigure(encoding="utf-8")
 
-from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
-from crawl4ai.content_filter_strategy import PruningContentFilter
-from crawl4ai.markdown_generation_strategy import DefaultMarkdownGenerator
+from extraction import EXTRACTION_MODES, Page, extract_page
+from fetching import DEFAULT_CONCURRENCY, Fetcher, FetchProgress
+from outputs import (
+    save_combined_markdown,
+    save_csv,
+    save_failed_urls,
+    save_links_file,
+    save_structured_files,
+)
+from proxy import ProxyConfigError, build_proxy_endpoints, check_proxies, load_proxy_settings
 
 
-# Default CSS selectors to exclude (nav, footers, ads, etc.)
+# Blocks that repeat across a site and are not page content. trafilatura already
+# removes headers, footers and navigation, so this list is for the site-specific
+# extras it cannot know about - related-content carousels, subscribe forms, and
+# so on. Add your own site's selectors here.
 DEFAULT_EXCLUDED_SELECTORS = [
-    # Structural elements
-    "header",
-    "footer",
-    "nav",
-    "aside",
-    ".header",
-    ".footer",
-    ".nav",
-    ".sidebar",
-    ".navigation",
-    ".menu",
-    # Ads
-    ".ads",
-    ".advertisement",
-    # Social / comments
+    ".js-cards",           # hso.com: "discover more" / related-content carousels
+    ".gform-subscribe",
+    ".blog-sidebar",
     ".social-share",
+    ".related-posts",
     ".comments",
     ".comment",
-    ".related-posts",
-    # Inline elements handled by excluded_tags but listed here for selector-based removal too
-    "script",
-    "style",
-    "iframe",
-    "noscript",
-    "form",
-    # Add more specific selectors here
-    ".blog-sidebar",
-    ".gform-subscribe",
+    ".ads",
+    ".advertisement",
+    ".cookie-banner",
 ]
 
-# Default CSS selectors for main content extraction (tried in order; first match wins)
-DEFAULT_MAIN_CONTENT_SELECTORS = [
-    "main",
-    "article",
-    "[role='main']",
-    ".main-content",
-    "#main-content",
-    ".content",
-    "#content",
-    ".post-content",
-    ".entry-content",
-    ".article-content",
-]
+# Below this many characters a page is treated as having no real content
+MIN_CONTENT_CHARS = 50
 
 
-def load_urls(filepath: str) -> list[str]:
+def load_urls(filepath: str | Path) -> list[str]:
     """Load URLs from a file, one per line. Ignores empty lines and comments (#)."""
     urls = []
-    with open(filepath, "r") as f:
+    with open(filepath, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#"):
                 urls.append(line)
-    return urls
+    return list(dict.fromkeys(urls))  # de-duplicate, preserve order
 
 
-def load_excluded_selectors(filepath: str | None) -> list[str]:
-    """Load custom CSS selectors to exclude from a file."""
-    if not filepath:
-        return DEFAULT_EXCLUDED_SELECTORS
-    
-    selectors = []
-    path = Path(filepath)
-    if path.exists():
-        with open(path, "r") as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith("#"):
-                    selectors.append(line)
-        print(f"📋 Loaded {len(selectors)} custom exclusion selectors")
-        return selectors
-    else:
-        print(f"⚠️  Exclusion file not found: {filepath}, using defaults")
-        return DEFAULT_EXCLUDED_SELECTORS
+def load_excluded_selectors(filepath: str | None, use_defaults: bool = True) -> list[str]:
+    """Load CSS selectors to exclude, from a file and/or the built-in defaults."""
+    selectors = list(DEFAULT_EXCLUDED_SELECTORS) if use_defaults else []
+
+    if filepath:
+        path = Path(filepath)
+        if path.exists():
+            custom = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith("#"):
+                        custom.append(line)
+            print(f"📋 Loaded {len(custom)} custom exclusion selectors from {path}")
+            selectors.extend(custom)
+        else:
+            print(f"⚠️  Exclusion file not found: {filepath}")
+
+    return list(dict.fromkeys(selectors))
 
 
-def sanitize_for_csv(text: str) -> str:
-    """Clean text for CSV output."""
-    if not text:
-        return ""
-    return text.replace("\r\n", "\n").replace("\r", "\n")
-
-
-def extract_internal_links(result, base_url: str) -> list[str]:
-    """Extract internal links from crawl result."""
-    if not result.links:
-        return []
-    
-    base_domain = urlparse(base_url).netloc
-    internal = []
-    
-    # result.links has 'internal' and 'external' keys
-    if isinstance(result.links, dict):
-        for link_info in result.links.get("internal", []):
-            if isinstance(link_info, dict):
-                internal.append(link_info.get("href", ""))
-            else:
-                internal.append(str(link_info))
-    
-    return [l for l in internal if l]
-
-
-async def crawl_urls(
+async def crawl(
     urls: list[str],
-    use_js: bool = False,
+    proxy_endpoints=None,
+    excluded_selectors: list[str] | None = None,
     extract_links: bool = False,
-    excluded_selectors: list[str] = None,
-    main_content_selectors: list[str] = None,
-    filter_threshold: float = 0.48,
-) -> list[dict]:
+    mode: str = "balanced",
+    concurrency: int = DEFAULT_CONCURRENCY,
+    timeout: float = 30.0,
+    retries: int = 2,
+) -> list[Page]:
     """
-    Crawl all URLs in parallel and return results.
+    Fetch and extract every URL, returning results in the order given.
 
-    Args:
-        urls: List of URLs to crawl
-        use_js: Whether to enable JavaScript rendering (slower but needed for dynamic sites)
-        extract_links: Whether to extract internal links from pages
-        excluded_selectors: CSS selectors to exclude from content
-        main_content_selectors: CSS selectors for main content extraction (comma-joined, first match wins)
-        filter_threshold: PruningContentFilter threshold (lower = more content)
+    Extraction runs in a worker thread as each response arrives, so parsing
+    overlaps with the requests still in flight.
     """
-    results = []
-    excluded = excluded_selectors or DEFAULT_EXCLUDED_SELECTORS
-    main_selectors = main_content_selectors if main_content_selectors is not None else DEFAULT_MAIN_CONTENT_SELECTORS
+    progress = FetchProgress(total=len(urls))
+    pages: dict[str, Page] = {}
 
-    # Configure browser
-    browser_config = BrowserConfig(
-        headless=True,
-        java_script_enabled=use_js,
-    )
+    async def handle(result) -> None:
+        if result.ok:
+            page = await asyncio.to_thread(
+                extract_page,
+                result.html,
+                result.url,
+                excluded_selectors,
+                extract_links,
+                mode,
+            )
+            detail = f"({len(page.markdown):,} chars"
+            detail += f", {len(page.internal_links)} links)" if extract_links else ")"
+            if result.attempts > 1:
+                detail += f" after {result.attempts} attempts"
+        else:
+            page = Page(url=result.url, success=False, error=result.error)
+            detail = f"- {result.error}"
 
-    # Configure markdown generation with content filtering
-    md_generator = DefaultMarkdownGenerator(
-        content_filter=PruningContentFilter(
-            threshold=filter_threshold,
-            threshold_type="fixed"
+        pages[result.url] = page
+        progress.record(page.success, result.url, detail)
+
+    async with Fetcher(
+        endpoints=proxy_endpoints,
+        concurrency=concurrency,
+        timeout=timeout,
+        retries=retries,
+    ) as fetcher:
+        await fetcher.fetch_all(urls, on_result=handle)
+
+    print(f"\n   {progress.summary()}")
+
+    # Preserve the caller's order, and never silently drop a URL
+    return [
+        pages.get(url) or Page(url=url, success=False, error="No result returned")
+        for url in urls
+    ]
+
+
+async def resolve_proxy(args):
+    """
+    Turn CLI flags plus .env into proxy endpoints, printing what was resolved.
+
+    Returns None when crawling directly. Exits on a configuration error, or on a
+    failed health check when --check-proxy was requested.
+    """
+    # --check-proxy implies the proxy should be on
+    enabled = True if args.check_proxy and args.proxy is None else args.proxy
+
+    try:
+        settings = load_proxy_settings(
+            env_file=args.env_file,
+            enabled=enabled,
+            sessions=args.proxy_sessions,
+            country=args.proxy_country,
         )
-    )
+    except ProxyConfigError as e:
+        print(f"❌ Proxy configuration error: {e}")
+        sys.exit(1)
 
-    # Configure crawler run
-    run_config = CrawlerRunConfig(
-        cache_mode=CacheMode.BYPASS,
-        markdown_generator=md_generator,
-        excluded_tags=["script", "style", "noscript", "iframe", "form"],
-        excluded_selector=",".join(excluded),  # CSS selectors to remove
-        css_selector=",".join(main_selectors) if main_selectors else None,  # target main content
-        page_timeout=30000,
-        stream=True,
-    )
-    
-    mode_str = "JS-rendered" if use_js else "static HTML"
-    print(f"\n🚀 Starting crawl of {len(urls)} URLs ({mode_str})...\n")
-    
-    async with AsyncWebCrawler(config=browser_config) as crawler:
-        async for result in await crawler.arun_many(urls, config=run_config):
-            if result.success:
-                # Get filtered markdown
-                markdown = ""
-                if result.markdown:
-                    if hasattr(result.markdown, 'fit_markdown') and result.markdown.fit_markdown:
-                        markdown = result.markdown.fit_markdown
-                    elif hasattr(result.markdown, 'raw_markdown'):
-                        markdown = result.markdown.raw_markdown
-                    else:
-                        markdown = str(result.markdown)
-                
-                # Strip links from markdown content if link extraction is not enabled
-                if not extract_links:
-                    # Replace [text](url) with text, but keep ![image](url)
-                    markdown = re.sub(r'(?<!!)\[([^\]]+)\]\([^\)]+\)', r'\1', markdown)
-                
-                entry = {
-                    "url": result.url,
-                    "success": True,
-                    "markdown": markdown,
-                    "title": result.metadata.get("title", "") if result.metadata else "",
-                }
-                
-                if extract_links:
-                    entry["internal_links"] = extract_internal_links(result, result.url)
-                
-                results.append(entry)
-                link_count = len(entry.get("internal_links", [])) if extract_links else 0
-                link_info = f", {link_count} links" if extract_links else ""
-                print(f"✅ {result.url} ({len(markdown):,} chars{link_info})")
+    if settings is None:
+        if args.check_proxy:
+            print("❌ --check-proxy needs the proxy enabled (use --proxy or set PROXY_ENABLED=true)")
+            sys.exit(1)
+        print("🌐 Proxy disabled - crawling directly")
+        return None
+
+    endpoints = build_proxy_endpoints(settings)
+    print(f"🛡️  Proxy enabled: {settings.describe()}")
+
+    if args.check_proxy:
+        print("\n🔎 Checking proxy connectivity...")
+        checks = await check_proxies(endpoints)
+        for check in checks:
+            if check.ok:
+                print(f"  ✅ {check.endpoint.label}: exit IP {check.exit_ip}")
             else:
-                results.append({
-                    "url": result.url,
-                    "success": False,
-                    "markdown": "",
-                    "title": "",
-                    "error": result.error_message,
-                })
-                print(f"❌ {result.url} - Error: {result.error_message}")
-    
-    return results
+                print(f"  ❌ {check.endpoint.label}: {check.error}")
+        if not any(c.ok for c in checks):
+            print("\n❌ No proxy session could be reached. Check your credentials and plan status.")
+            sys.exit(1)
+        unique = {c.exit_ip for c in checks if c.ok}
+        print(f"\n✨ {sum(c.ok for c in checks)}/{len(checks)} sessions OK, {len(unique)} unique exit IP(s)")
+        sys.exit(0)
 
-
-def save_csv(results: list[dict], output_path: Path, include_links: bool = False):
-    """Save results to CSV."""
-    with open(output_path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, quoting=csv.QUOTE_ALL)
-        
-        headers = ["url", "title", "success", "markdown"]
-        if include_links:
-            headers.append("internal_links")
-        writer.writerow(headers)
-        
-        for r in results:
-            row = [
-                r["url"],
-                r.get("title", ""),
-                r["success"],
-                sanitize_for_csv(r["markdown"]),
-            ]
-            if include_links:
-                links = r.get("internal_links", [])
-                row.append("\n".join(links) if links else "")
-            writer.writerow(row)
-    
-    print(f"\n📄 CSV saved to: {output_path}")
-
-
-def save_combined_markdown(results: list[dict], output_path: Path, include_links: bool = False):
-    """Save all content to a single combined markdown file."""
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("# Combined Crawl Results\n\n")
-        f.write(f"*Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*\n\n")
-        f.write(f"*Total URLs: {len(results)}*\n\n")
-        f.write("---\n\n")
-        
-        for i, r in enumerate(results, 1):
-            if r["success"] and r["markdown"]:
-                title = r.get("title") or r["url"]
-                f.write(f"## {i}. {title}\n\n")
-                f.write(f"**Source:** {r['url']}\n\n")
-                f.write(r["markdown"])
-                
-                if include_links and r.get("internal_links"):
-                    f.write("\n\n### Internal Links\n\n")
-                    for link in r["internal_links"][:20]:  # Limit to first 20
-                        f.write(f"- {link}\n")
-                    if len(r["internal_links"]) > 20:
-                        f.write(f"- ... and {len(r['internal_links']) - 20} more\n")
-                
-                f.write("\n\n---\n\n")
-            else:
-                f.write(f"## {i}. {r['url']}\n\n")
-                f.write(f"*Failed to crawl: {r.get('error', 'Unknown error')}*\n\n")
-                f.write("---\n\n")
-    
-    print(f"📝 Combined markdown saved to: {output_path}")
-
-
-def save_links_file(results: list[dict], output_path: Path):
-    """Save all discovered internal links to a separate file."""
-    all_links = set()
-    for r in results:
-        if r.get("internal_links"):
-            all_links.update(r["internal_links"])
-    
-    with open(output_path, "w", encoding="utf-8") as f:
-        f.write("# Discovered Internal Links\n")
-        f.write(f"# Total unique links: {len(all_links)}\n\n")
-        for link in sorted(all_links):
-            f.write(f"{link}\n")
-    
-    print(f"🔗 Links saved to: {output_path} ({len(all_links)} unique)")
-
-
-def sanitize_filename(name: str) -> str:
-    """Sanitize string to be safe for filenames."""
-    # Remove invalid characters
-    name = re.sub(r'[<>:"/\\|?*]', '', name)
-    # Replace newlines and tabs
-    name = name.replace('\n', ' ').replace('\r', '').replace('\t', ' ')
-    # Trim whitespace
-    return name.strip()
-
-
-def save_structured_files(results: list[dict], output_dir: Path):
-    """
-    Save content in a folder structure matching the URL hierarchy.
-    Filenames are based on the page title.
-    Example: https://example.com/foo/bar -> output/example.com/foo/Page Title.md
-    """
-    count = 0
-    for r in results:
-        if not r["success"] or not r["markdown"]:
-            continue
-            
-        try:
-            parsed = urlparse(r["url"])
-            domain = parsed.netloc
-            path = parsed.path.strip("/")
-            
-            # Determine directory path based on URL
-            if not path:
-                dir_path = output_dir / domain
-            else:
-                parts = path.split("/")
-                if r["url"].endswith("/"):
-                     dir_path = output_dir / domain / path
-                else:
-                     # If it doesn't end in slash, the last part is usually a file or resource name.
-                     # We want to keep the structure, so we use the parent of the resource as the folder.
-                     # e.g. example.com/foo/bar -> output/example.com/foo/
-                     parent_path = Path(*parts[:-1])
-                     dir_path = output_dir / domain / parent_path
-            
-            # Determine filename from title
-            title = r.get("title", "").strip()
-            if not title:
-                # Fallback to last segment of path or index
-                title = parts[-1] if path and not r["url"].endswith("/") else "index"
-            
-            filename = f"{sanitize_filename(title)}.md"
-            
-            # Create directories
-            dir_path.mkdir(parents=True, exist_ok=True)
-            
-            # Handle collisions
-            file_path = dir_path / filename
-            counter = 1
-            while file_path.exists():
-                file_path = dir_path / f"{sanitize_filename(title)}_{counter}.md"
-                counter += 1
-            
-            # Write content
-            with open(file_path, "w", encoding="utf-8") as f:
-                f.write(f"# {title}\n\n")
-                f.write(f"**Source:** {r['url']}\n\n")
-                f.write(r["markdown"])
-                
-                if r.get("internal_links"):
-                    f.write("\n\n---\n### Internal Links\n\n")
-                    for link in r["internal_links"]:
-                        f.write(f"- {link}\n")
-            
-            count += 1
-            
-        except Exception as e:
-            print(f"⚠️  Failed to save structured file for {r['url']}: {e}")
-            
-    print(f"📂 Saved {count} files in structured folders under {output_dir}")
+    return endpoints
 
 
 def parse_args():
@@ -379,105 +197,122 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python crawler.py                          # Basic crawl (no JS)
-  python crawler.py --js                     # Enable JavaScript rendering
+  python crawler.py                          # Crawl urls.txt
   python crawler.py --links                  # Extract internal links
-  python crawler.py --exclude exclude.txt    # Custom CSS exclusions
-  python crawler.py --threshold 0.3          # Lower threshold = more content
-        """
+  python crawler.py --structured             # Save a folder per URL path
+  python crawler.py --mode precision         # Keep less borderline content
+  python crawler.py --concurrency 80         # Fetch more pages at once
+
+Proxy (ProxyScrape) examples:
+  python crawler.py --proxy                  # Force proxy on (credentials from .env)
+  python crawler.py --no-proxy               # Force proxy off
+  python crawler.py --proxy-sessions 5       # Spread requests over 5 sticky IPs
+  python crawler.py --check-proxy            # Test the proxy, print exit IPs, exit
+        """,
     )
     parser.add_argument("urls_file", nargs="?", default="urls.txt",
                         help="File containing URLs to crawl (default: urls.txt)")
     parser.add_argument("-o", "--output", default="output",
                         help="Output directory (default: output)")
-    parser.add_argument("--js", action="store_true",
-                        help="Enable JavaScript rendering (slower, use for dynamic sites)")
     parser.add_argument("--links", action="store_true",
-                        help="Extract internal links from pages")
-    parser.add_argument("--exclude", metavar="FILE",
-                        help="File with CSS selectors to exclude (one per line)")
-    parser.add_argument("--threshold", type=float, default=0.48,
-                        help="Content filter threshold 0.0-1.0 (default: 0.48, lower=more content)")
-    parser.add_argument("--no-default-exclusions", action="store_true",
-                        help="Don't use default CSS exclusions (nav, footer, ads, etc.)")
-    parser.add_argument("--no-main-selector", action="store_true",
-                        help="Don't restrict extraction to main content selectors (use full page)")
+                        help="Keep inline links and extract internal links from pages")
     parser.add_argument("--structured", action="store_true",
                         help="Save output in a folder structure matching URL paths")
-    
+    parser.add_argument("--mode", choices=EXTRACTION_MODES, default="balanced",
+                        help="How much borderline content to keep (default: balanced)")
+    parser.add_argument("--exclude", metavar="FILE",
+                        help="File with extra CSS selectors to exclude (one per line)")
+    parser.add_argument("--no-default-exclusions", action="store_true",
+                        help="Don't use the built-in CSS exclusions")
+
+    perf = parser.add_argument_group("performance and reliability")
+    perf.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY, metavar="N",
+                      help=f"Pages to fetch at once (default: {DEFAULT_CONCURRENCY})")
+    perf.add_argument("--timeout", type=float, default=30.0, metavar="SECONDS",
+                      help="Per-request timeout (default: 30)")
+    perf.add_argument("--retries", type=int, default=2, metavar="N",
+                      help="Retries per URL after the first attempt (default: 2)")
+
+    proxy_group = parser.add_argument_group("proxy (ProxyScrape)")
+    toggle = proxy_group.add_mutually_exclusive_group()
+    toggle.add_argument("--proxy", dest="proxy", action="store_true", default=None,
+                        help="Route traffic through the proxy (overrides PROXY_ENABLED)")
+    toggle.add_argument("--no-proxy", dest="proxy", action="store_false",
+                        help="Crawl directly, ignoring PROXY_ENABLED")
+    proxy_group.add_argument("--proxy-sessions", type=int, metavar="N",
+                             help="Number of sticky proxy sessions to spread requests over")
+    proxy_group.add_argument("--proxy-country", metavar="CODE",
+                             help="Country code for proxy exit nodes (e.g. us, gb, de)")
+    proxy_group.add_argument("--check-proxy", action="store_true",
+                             help="Test the proxy connection, print exit IPs, and exit")
+    proxy_group.add_argument("--env-file", metavar="FILE", default=".env",
+                             help="Path to the .env file with proxy credentials (default: .env)")
+
     return parser.parse_args()
 
 
 async def main():
     args = parse_args()
-    
+
+    # Resolve the proxy first: --check-proxy exits here and needs no URLs file
+    proxy_endpoints = await resolve_proxy(args)
+
     urls_file = Path(args.urls_file)
     output_dir = Path(args.output)
-    
-    # Validate input file
+
     if not urls_file.exists():
         print(f"❌ URLs file not found: {urls_file}")
         print("\nCreate a urls.txt file with one URL per line.")
         sys.exit(1)
-    
-    # Create output directory
-    output_dir.mkdir(parents=True, exist_ok=True)
-    
-    # Load URLs
+
     urls = load_urls(urls_file)
     if not urls:
         print("❌ No URLs found in file")
         sys.exit(1)
-    
+
+    output_dir.mkdir(parents=True, exist_ok=True)
     print(f"📋 Loaded {len(urls)} URLs from {urls_file}")
-    
-    # Load exclusion selectors
-    if args.no_default_exclusions:
-        excluded = []
-        if args.exclude:
-            excluded = load_excluded_selectors(args.exclude)
-    else:
-        excluded = load_excluded_selectors(args.exclude) if args.exclude else DEFAULT_EXCLUDED_SELECTORS
-    
+
+    excluded = load_excluded_selectors(args.exclude, use_defaults=not args.no_default_exclusions)
     print(f"🚫 Excluding {len(excluded)} CSS selectors")
 
-    # Main content selectors
-    main_selectors = [] if args.no_main_selector else DEFAULT_MAIN_CONTENT_SELECTORS
-    if main_selectors:
-        print(f"🎯 Targeting main content via {len(main_selectors)} selectors")
+    route = "via proxy" if proxy_endpoints else "direct"
+    print(f"\n🚀 Crawling {len(urls)} URLs - {route}, {args.concurrency} at a time, mode: {args.mode}\n")
 
-    # Crawl
-    results = await crawl_urls(
+    started = time.perf_counter()
+    pages = await crawl(
         urls,
-        use_js=args.js,
-        extract_links=args.links,
+        proxy_endpoints=proxy_endpoints,
         excluded_selectors=excluded,
-        main_content_selectors=main_selectors,
-        filter_threshold=args.threshold,
+        extract_links=args.links,
+        mode=args.mode,
+        concurrency=args.concurrency,
+        timeout=args.timeout,
+        retries=args.retries,
     )
-    
-    # Generate timestamp for output files
+    elapsed = time.perf_counter() - started
+    print(f"⏱️  Total time: {elapsed // 60:.0f}m{elapsed % 60:04.1f}s")
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    # Save outputs
-    csv_path = output_dir / f"crawl_results_{timestamp}.csv"
-    md_path = output_dir / f"combined_content_{timestamp}.md"
-    
-    save_csv(results, csv_path, include_links=args.links)
-    save_combined_markdown(results, md_path, include_links=args.links)
-    
-    # Save structured files if requested
+    save_csv(pages, output_dir / f"crawl_results_{timestamp}.csv", include_links=args.links)
+    save_combined_markdown(pages, output_dir / f"combined_content_{timestamp}.md", include_links=args.links)
+
     if args.structured:
-        save_structured_files(results, output_dir)
-    
-    # Save links file if extracting links
+        save_structured_files(pages, output_dir)
     if args.links:
-        links_path = output_dir / f"discovered_links_{timestamp}.txt"
-        save_links_file(results, links_path)
-    
-    # Summary
-    successful = sum(1 for r in results if r["success"])
-    print(f"\n✨ Done! {successful}/{len(results)} URLs crawled successfully")
+        save_links_file(pages, output_dir / f"discovered_links_{timestamp}.txt")
+
+    failed_count = save_failed_urls(pages, output_dir / f"failed_urls_{timestamp}.txt")
+
+    successful = sum(1 for p in pages if p.success)
+    thin = sum(1 for p in pages if p.success and len(p.markdown) < MIN_CONTENT_CHARS)
+
+    print(f"\n✨ Done! {successful}/{len(pages)} URLs crawled successfully")
+    if thin:
+        print(f"ℹ️  {thin} pages had almost no text (thin pages, or a selector miss)")
+    if failed_count:
+        print(f"⚠️  {failed_count} URLs still failed; re-run them with:")
+        print(f"     python crawler.py {output_dir / f'failed_urls_{timestamp}.txt'}")
 
 
 if __name__ == "__main__":
