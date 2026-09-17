@@ -204,9 +204,17 @@ class Fetcher:
             async with semaphore:
                 result = await self._fetch_one(url)
             if on_result is not None:
-                outcome = on_result(result)
-                if asyncio.iscoroutine(outcome):
-                    await outcome
+                try:
+                    outcome = on_result(result)
+                    if asyncio.iscoroutine(outcome):
+                        await outcome
+                except Exception as exc:
+                    # A handler that raises must not abort every other request.
+                    result.ok = False
+                    result.error = f"Processing failed: {type(exc).__name__}: {exc}"[:200]
+            # Drop the body once it has been handled: holding every page's HTML
+            # would cost gigabytes on a large crawl, and the caller has had it.
+            result.html = ""
             results.append(result)
 
         await asyncio.gather(*(worker(u) for u in urls))

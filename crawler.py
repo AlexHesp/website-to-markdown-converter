@@ -12,8 +12,10 @@ trafilatura, which finds the main article body and drops boilerplate itself.
 
 import argparse
 import asyncio
+import signal
 import sys
 import time
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -85,6 +87,36 @@ def load_excluded_selectors(filepath: str | None, use_defaults: bool = True) -> 
     return list(dict.fromkeys(selectors))
 
 
+@contextmanager
+def _stop_signals():
+    """
+    Turn SIGINT/SIGTERM into a settable event for the duration of a crawl.
+
+    Yields an asyncio.Event that is set when the user interrupts. The previous
+    handlers are restored on exit. On platforms without loop signal handler
+    support the event simply never fires.
+    """
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    installed = []
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, stop.set)
+            installed.append(sig)
+        except (NotImplementedError, AttributeError, ValueError):
+            pass  # Windows, or no running loop control over this signal
+
+    try:
+        yield stop
+    finally:
+        for sig in installed:
+            try:
+                loop.remove_signal_handler(sig)
+            except Exception:
+                pass
+
+
 async def crawl(
     urls: list[str],
     proxy_endpoints=None,
@@ -125,19 +157,49 @@ async def crawl(
         pages[result.url] = page
         progress.record(page.success, result.url, detail)
 
+    interrupted = False
+
     async with Fetcher(
         endpoints=proxy_endpoints,
         concurrency=concurrency,
         timeout=timeout,
         retries=retries,
     ) as fetcher:
-        await fetcher.fetch_all(urls, on_result=handle)
+        fetch_task = asyncio.create_task(fetcher.fetch_all(urls, on_result=handle))
+
+        # Stop on Ctrl-C by cancelling the crawl rather than letting the
+        # KeyboardInterrupt escape, so that everything fetched so far still
+        # gets written out. asyncio.run() would otherwise abort the process
+        # before any output is saved.
+        with _stop_signals() as stop_requested:
+            stop_task = asyncio.create_task(stop_requested.wait())
+            done, _ = await asyncio.wait(
+                {fetch_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+
+            if stop_task in done:
+                interrupted = True
+                print("\n\n⏹️  Stopping - saving what has been crawled so far...")
+                fetch_task.cancel()
+                await asyncio.gather(fetch_task, return_exceptions=True)
+            else:
+                stop_task.cancel()
+                await asyncio.gather(stop_task, return_exceptions=True)
+                # Surface a genuine crash, but keep the partial results
+                if fetch_task.exception() is not None:
+                    exc = fetch_task.exception()
+                    interrupted = True
+                    print(f"\n\n💥 Crawl stopped early: {type(exc).__name__}: {exc}")
+                    print("   Saving what has been crawled so far...")
 
     print(f"\n   {progress.summary()}")
+    if interrupted:
+        remaining = len(urls) - len(pages)
+        print(f"   {remaining} URLs were not reached; they are listed in the failed URLs file")
 
     # Preserve the caller's order, and never silently drop a URL
     return [
-        pages.get(url) or Page(url=url, success=False, error="No result returned")
+        pages.get(url) or Page(url=url, success=False, error="Not reached")
         for url in urls
     ]
 

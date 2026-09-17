@@ -52,6 +52,20 @@ def selectors_to_xpath(selectors: list[str]) -> list[str]:
     return [x for x in xpaths if x]
 
 
+def _strip_comments(tree) -> None:
+    """
+    Remove HTML comment nodes from the tree.
+
+    Comments carry no content, and trafilatura crashes on some pages that hide
+    one inside a <table>: it tries to retag every child of the table, and lxml
+    refuses to let a comment's tag be set.
+    """
+    for comment in tree.xpath("//comment()"):
+        parent = comment.getparent()
+        if parent is not None:
+            parent.remove(comment)
+
+
 def _page_title(tree) -> str:
     """
     Read the title straight off the parsed tree.
@@ -111,21 +125,29 @@ def extract_page(
     except Exception as exc:
         return Page(url=url, success=False, error=f"Could not parse HTML: {exc}")
 
+    _strip_comments(tree)
+
     # Read title and links before extraction, which consumes the tree.
     title = _page_title(tree)
     links = _internal_links(tree, url) if include_links else []
 
     prune = selectors_to_xpath(exclude_selectors or [])
-    markdown = trafilatura.extract(
-        copy.deepcopy(tree),   # trafilatura prunes the tree it is given
-        output_format="markdown",
-        include_links=include_links,
-        include_tables=True,
-        include_comments=False,
-        favor_recall=(mode == "recall"),
-        favor_precision=(mode == "precision"),
-        prune_xpath=prune or None,
-    ) or ""
+    try:
+        markdown = trafilatura.extract(
+            copy.deepcopy(tree),   # trafilatura prunes the tree it is given
+            output_format="markdown",
+            include_links=include_links,
+            include_tables=True,
+            include_comments=False,
+            favor_recall=(mode == "recall"),
+            favor_precision=(mode == "precision"),
+            prune_xpath=prune or None,
+        ) or ""
+    except Exception as exc:
+        # One unparseable page must never take down a whole crawl, so an
+        # extraction failure is reported as a failed page and nothing more.
+        return Page(url=url, success=False, title=title,
+                    error=f"Extraction failed: {type(exc).__name__}: {exc}"[:200])
 
     return Page(
         url=url,
